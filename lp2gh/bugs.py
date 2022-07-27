@@ -1,8 +1,12 @@
+import traceback
+
 import re
 import urllib2
 
 import gflags
 import jsontemplate
+import base64
+import lazr
 
 from lp2gh import client
 from lp2gh import exporter
@@ -18,6 +22,9 @@ gflags.DEFINE_boolean('only_open_bugs', False,
 BUG_STATUS = ['New',
               'Incomplete',
               'Invalid',
+              'Opinion',
+              'Expired',
+              'Incomplete',
               "Won't Fix",
               'Confirmed',
               'Triaged',
@@ -28,7 +35,8 @@ BUG_STATUS = ['New',
 
 BUG_CLOSED_STATUS = ['Invalid',
                      "Won't Fix",
-                     'Fix Released']
+                     'Fix Released',
+                     "Expired"]
 
 
 BUG_IMPORTANCE = ['Critical',
@@ -56,45 +64,63 @@ Imported from Launchpad using lp2gh.
  * the launchpad url was {lp_url}
 """
 
+def dict_from_attachment(attachment):
+  # b64data = base64.b64encode(attachment.data.open("r"))
+  # attachment.data.close()
+  return {'title': attachment.title, 
+  # data: b64data
+  'url': attachment.web_link + "/+files/" +attachment.title # hack since the launchpad lib doesn't seem to return the actual filepath
+  }
 
 def message_to_dict(message):
-  owner = message.owner
-  return {'owner': owner.name,
-          'content': message.content,
-          'date_created': util.to_timestamp(message.date_created),
-          }
-
+  # A message object might still lead to 404 in the API when the comment has been
+  # deleted. So if that happens, we just return none and hope the calle filters those out.
+  try:
+    owner = message.owner
+    return {'owner': owner.name,
+            'content': message.content,
+            'date_created': util.to_timestamp(message.date_created),
+            'attachments': [dict_from_attachment(attachment) for attachment in message.bug_attachments]
+            }
+  # This always got stuck somewhere, idc just print the error continue
+  except Exception:
+    traceback.print_exc()
+    return None
+ 
 
 def bug_task_to_dict(bug_task):
-  bug = bug_task.bug
-  assignee = bug_task.assignee
-  owner = bug_task.owner
-  messages = list(bug.messages)[1:]
-  milestone = bug_task.milestone
-  duplicates = bug.duplicates
-  duplicate_of = bug.duplicate_of
-  return {'id': bug.id,
-          'status': bug_task.status,
-          'importance': bug_task.importance,
-          'assignee': assignee and assignee.name or None,
-          'owner': owner.name,
-          'milestone': milestone and milestone.name,
-          'title': bug.title,
-          'description': bug.description,
-          'duplicate_of': duplicate_of and duplicate_of.id or None,
-          'duplicates': [x.id for x in duplicates],
-          'date_created': util.to_timestamp(bug_task.date_created),
-          'comments': [message_to_dict(x) for x in messages],
-          'tags': bug.tags,
-          'security_related': bug.security_related,
-          'lp_url': bug.web_link,
-          }
+    bug = bug_task.bug
+    assignee = bug_task.assignee
+    owner = bug_task.owner
+    messages = list(bug.messages)[1:]
+    milestone = bug_task.milestone
+    duplicates = bug.duplicates
+    duplicate_of = bug.duplicate_of
+    comments = [message_to_dict(x) for x in messages]
+    return {'id': bug.id,
+            'status': bug_task.status,
+            'importance': bug_task.importance,
+            'assignee': assignee and assignee.name or None,
+            'owner': owner.name,
+            'milestone': milestone and milestone.name,
+            'title': bug.title,
+            'description': bug.description,
+            'attachments': [dict_from_attachment(attachment) for attachment in bug.attachments],
+            'duplicate_of': duplicate_of and duplicate_of.id or None,
+            'duplicates': [x.id for x in duplicates],
+            'date_created': util.to_timestamp(bug_task.date_created),
+            'comments': [comment for comment in comments if comment is not None],
+            'tags': bug.tags,
+            'security_related': bug.security_related,
+            'lp_url': bug.web_link,
+            }
+      
 
 
 def list_bugs(project, only_open=None):
   if only_open is None:
     only_open = FLAGS.only_open_bugs
-  return project.searchTasks(status=only_open and None or BUG_STATUS)
+  return project.searchTasks(status=only_open and None or BUG_STATUS, omit_duplicates=False)
 
 
 def _replace_bugs(s, bug_mapping):
@@ -133,10 +159,14 @@ def export(project, only_open=None):
   p = c.project(project)
   e = exporter.Exporter()
   bugs = list_bugs(p, only_open=only_open)
-  for x in bugs:
-    e.emit('fetching %s' % x.title)
-    rv = bug_task_to_dict(x)
-    o.append(rv)
+  num_bugs = len(bugs)
+  for i, x in enumerate(bugs):
+    e.emit('%d/%d fetching %s' % (i, num_bugs, x.title))
+    try:
+      rv = bug_task_to_dict(x)
+      o.append(rv)
+    except lazr.restfulclient.errors.RestfulError as error:
+      e.emit("failed exporting: %s, skipping %s" % (error, x.title))
   return o
 
 
